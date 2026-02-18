@@ -1,6 +1,6 @@
 {
   "name": "com.lgcchina.fix-skinned-mesh-tool",
-  "displayName": "Fix SkinnedMesh Tool",
+  "displayName": "LGC_修复蒙皮网格引用工具",
   "version": "1.0.0",
   "unity": "2022.3",
   "description": "修复改模型时不小心删除网格物体，需要从原fbx加回场景人物",
