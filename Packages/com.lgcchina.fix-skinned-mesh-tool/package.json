@@ -9,9 +9,6 @@
     "url": "https://github.com/LgcChina"
   },
   "vpmDependencies": {
-    "com.vrchat.base": "3.x.x",
-    "com.vrchat.worlds": "3.x.x",
-    "com.vrchat.avatars": "3.x.x"
   },
   "keywords": [ "VRChat", "Unity", "SkinnedMeshRenderer", "Fix", "Avatar", "World" ]
 }
