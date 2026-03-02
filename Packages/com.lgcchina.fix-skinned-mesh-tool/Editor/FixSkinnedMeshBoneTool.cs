@@ -1,12 +1,11 @@
 #if UNITY_EDITOR
-using System;
+using UnityEngine;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine.SceneManagement;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-using UnityEditor;
-using UnityEditor.SceneManagement;
-using UnityEngine;
-using UnityEngine.SceneManagement;
 
 public class FixSkinnedMeshBoneTool : EditorWindow
 {
@@ -147,7 +146,9 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         EditorGUILayout.Space();
 
         // ========== 网格物体列表区域 ==========
-        EditorGUILayout.LabelField(showAllMeshObjects ? "所有网格物体列表" : "缺失网格物体列表", EditorStyles.boldLabel);
+        // 可选：简要图例
+        EditorGUILayout.LabelField(showAllMeshObjects ? "所有网格物体列表" : "缺失/无效网格物体列表", EditorStyles.boldLabel);
+        EditorGUILayout.LabelField("红色 = 路径缺失；黄色 = 无效蒙皮网格（无SMR/mesh为空/骨骼为空）", EditorStyles.miniLabel);
         EditorGUILayout.Space();
 
         bool hasMeshData = (showAllMeshObjects && allMeshObjectsTree.Count > 0)
@@ -170,7 +171,7 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         {
             string emptyTip = showAllMeshObjects
                 ? "暂无网格物体数据，点击上方检查按钮开始检测"
-                : "暂无缺失网格数据，点击上方检查按钮开始检测";
+                : "暂无缺失/无效网格数据，点击上方检查按钮开始检测";
             EditorGUILayout.LabelField(emptyTip, EditorStyles.centeredGreyMiniLabel);
         }
 
@@ -313,7 +314,7 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             return;
         }
 
-        // 兜底：如果两者都不是（不太可能），直接销毁
+        // 兜底：如果两者都不是（理论上不会），直接销毁
         UnityEngine.Object.DestroyImmediate(temp);
     }
 
@@ -452,6 +453,7 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         Debug.LogWarning("未自动识别到骨骼根节点，可手动指定骨骼根节点优化结果");
         return modelRoot;
     }
+
     // ---------- 核心检查逻辑 ----------
     private void CheckBonesAndMeshes()
     {
@@ -507,10 +509,23 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             Transform meshCompareRoot = tempSourceInstance.transform;
             CollectAllMeshes(meshCompareRoot, cachedDamagedPathDict, "", allMeshObjectsTree);
 
+            // 清空并重建“缺失/无效”列表
+            missingMeshObjectsTree.Clear();
             foreach (var meshNode in allMeshObjectsTree)
             {
-                if (!cachedDamagedPathDict.ContainsKey(meshNode.fullPath))
+                // 1) 路径完全缺失 -> 走“缺失网格”逻辑（红色）
+                bool pathMissing = !cachedDamagedPathDict.ContainsKey(meshNode.fullPath);
+                if (pathMissing)
                 {
+                    meshNode.isInvalidSkinnedMesh = false;
+                    missingMeshObjectsTree.Add(meshNode);
+                    continue;
+                }
+
+                // 2) 路径存在 -> 判定该路径上的SMR是否“无效”（sharedMesh==null / 无SMR / 骨骼全空）
+                if (IsInvalidSkinnedMeshOnDamaged(damagedModel, meshNode.fullPath))
+                {
+                    meshNode.isInvalidSkinnedMesh = true; // 黄色
                     missingMeshObjectsTree.Add(meshNode);
                 }
             }
@@ -524,17 +539,17 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             {
                 SetMessage(showAllMeshObjects
                     ? $"未检测到缺失骨骼！共识别到 {totalAllMeshes} 个网格物体"
-                    : "未检测到缺失骨骼或网格物体！", MessageType.Info);
+                    : "未检测到缺失/无效网格物体！", MessageType.Info);
             }
             else
             {
                 string meshInfo = showAllMeshObjects
-                    ? $"共识别到 {totalAllMeshes} 个网格物体（其中缺失 {totalMissingMeshes} 个）"
-                    : $"检测到 {totalMissingMeshes} 个缺失网格物体";
+                    ? $"共识别到 {totalAllMeshes} 个网格物体（其中缺失/无效 {totalMissingMeshes} 个）"
+                    : $"检测到 {totalMissingMeshes} 个缺失/无效网格物体";
                 SetMessage($"检测到 {totalMissingBones} 个缺失骨骼，{meshInfo}", MessageType.Warning);
             }
 
-            Debug.Log($"===== 检查完成：{totalMissingBones} 个缺失骨骼，{totalMissingMeshes} 个缺失网格（共{totalAllMeshes}个网格） =====");
+            Debug.Log($"===== 检查完成：{totalMissingBones} 个缺失骨骼，{totalMissingMeshes} 个缺失/无效网格（共{totalAllMeshes}个网格） =====");
         }
         catch (System.Exception e)
         {
@@ -578,7 +593,7 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         }
     }
 
-    // ---------- 绘制网格树UI（红色/加粗） ----------
+    // ---------- 绘制网格树UI（红色=缺失；黄色=无效；加粗=刚修复） ----------
     private void DrawMeshTree(List<BoneNode> nodes, int indentLevel)
     {
         foreach (var node in nodes)
@@ -586,20 +601,29 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             EditorGUILayout.BeginHorizontal();
             GUILayout.Space(indentLevel * 20);
 
+            // 1. 路径缺失（红色），2. 路径存在但无效SMR（黄色）
             bool isMissing = cachedDamagedPathDict != null && !cachedDamagedPathDict.ContainsKey(node.fullPath);
+            bool isInvalid = !isMissing && node.isInvalidSkinnedMesh;
             bool isRecentlyFixed = recentlyFixedMeshPaths.Contains(node.fullPath);
 
+            // 保存原始GUI状态
             Color originalColor = GUI.color;
             GUIStyle originalStyle = EditorStyles.label;
 
-            if (isMissing) GUI.color = Color.red;
+            // 设置颜色
+            if (isMissing)
+                GUI.color = Color.red;
+            else if (isInvalid)
+                GUI.color = Color.yellow;
 
+            // 加粗样式（刚修复）
             GUIStyle displayStyle = originalStyle;
             if (isRecentlyFixed)
             {
                 displayStyle = new GUIStyle(originalStyle) { fontStyle = FontStyle.Bold };
             }
 
+            // 绘制
             bool hasChildren = node.children.Count > 0;
             if (hasChildren)
             {
@@ -948,6 +972,30 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         }
     }
 
+    // ---------- “无效蒙皮网格”判定 ----------
+    private bool IsInvalidSkinnedMeshOnDamaged(GameObject damagedRoot, string fullPath)
+    {
+        var tr = FindTransformByFullPath(damagedRoot.transform, fullPath);
+        if (tr == null) return false; // 路径都不存在，交给“缺失”逻辑处理
+
+        var smr = tr.GetComponent<SkinnedMeshRenderer>();
+        if (smr == null) return true; // 有节点但没有SMR
+
+        if (smr.sharedMesh == null) return true;
+
+        var bones = smr.bones;
+        if (bones == null || bones.Length == 0) return true;
+
+        bool allNull = true;
+        for (int i = 0; i < bones.Length; i++)
+        {
+            if (bones[i] != null) { allNull = false; break; }
+        }
+        if (allNull) return true;
+
+        return false;
+    }
+
     // ---------- 辅助工具方法 ----------
     private string GetFullPathRelativeToRoot(Transform target, Transform root)
     {
@@ -1015,6 +1063,9 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         public Transform sourceTransform;
         public List<BoneNode> children = new List<BoneNode>();
         public bool isExpanded = false;
+
+        // 是否“无效蒙皮网格”（路径存在但SMR异常/mesh为空/骨骼空）
+        public bool isInvalidSkinnedMesh = false;
     }
 
     // ====================== 智能单网格自动分流支持 ======================
