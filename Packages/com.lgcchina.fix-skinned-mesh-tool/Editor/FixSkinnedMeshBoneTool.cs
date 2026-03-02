@@ -1,21 +1,25 @@
 #if UNITY_EDITOR
-
-using UnityEngine;
-using UnityEditor;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
 
 public class FixSkinnedMeshBoneTool : EditorWindow
 {
     private GameObject damagedModel;
-    private GameObject sourceFBX; // 仅接受Project窗口的FBX资产
+    private GameObject sourceFBX; // 仅接受Project窗口的FBX资产（支持拖入FBX子节点 -> 自动提升为根资产）
     private Transform customRootBone;
 
     // 显示控制
     private bool showAllMeshObjects = false;
-    // 新增：记录刚修复的网格物体全路径（用于加粗显示）
+
+    // 记录刚修复的网格物体全路径（用于加粗显示）
     private HashSet<string> recentlyFixedMeshPaths = new HashSet<string>();
+
     // 缓存损坏模型路径字典（用于判断是否缺失）
     private Dictionary<string, Transform> cachedDamagedPathDict;
 
@@ -36,6 +40,16 @@ public class FixSkinnedMeshBoneTool : EditorWindow
     private string infoMessage = "";
     private MessageType infoMessageType = MessageType.Info;
 
+    // 若用户拖了 FBX 子节点，这里保存其在 FBX 内的“可能路径/名称”提示
+    private string _sourceMeshPathHint = "";
+    private bool _sourceFromSubObject = false; // 用于 UI 提示
+
+    // ==== 临时源实例管理（双通道） ====
+    // 记录用 LoadPrefabContents 打开的根，用于 Cleanup 时 Unload
+    private HashSet<GameObject> _prefabContentsRoots = new HashSet<GameObject>();
+    // 记录用 Preview Scene 实例化的根，以及它所在的预览场景，用于 Cleanup 时销毁与关闭
+    private Dictionary<GameObject, Scene> _previewSceneRoots = new Dictionary<GameObject, Scene>();
+
     // 窗口菜单与标题
     [MenuItem("LGC/LGC 蒙皮网格骨骼修复工具")]
     public static void ShowWindow()
@@ -49,8 +63,18 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         EditorGUILayout.LabelField("将损坏的人物拖入槽位1，原始 FBX 资产拖入槽位2", EditorStyles.wordWrappedLabel);
         EditorGUILayout.Space();
 
+        // 槽位 1：损坏对象
         damagedModel = EditorGUILayout.ObjectField("损坏人物 (场景)", damagedModel, typeof(GameObject), true) as GameObject;
-        sourceFBX = EditorGUILayout.ObjectField("原始模型 (FBX资产)", sourceFBX, typeof(GameObject), false) as GameObject;
+
+        // 槽位 2：原始 FBX（支持拖入子节点或场景实例，内部会自动规范为 FBX 根资产）
+        var newSource = EditorGUILayout.ObjectField("原始模型 (FBX资产)", sourceFBX, typeof(GameObject), false) as GameObject;
+        if (newSource != sourceFBX)
+        {
+            sourceFBX = newSource;
+            NormalizeSourceFBXSelection(); // 自动提升为 FBX 根，并尝试生成子节点路径/名称提示
+        }
+
+        // 可选根骨
         EditorGUILayout.LabelField("骨骼根节点 (可选，覆盖自动识别)", EditorStyles.wordWrappedLabel);
         customRootBone = EditorGUILayout.ObjectField(customRootBone, typeof(Transform), true) as Transform;
 
@@ -62,25 +86,51 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             EditorGUILayout.HelpBox(infoMessage, infoMessageType);
         }
 
+        // 当损坏对象像“单个网格子物体”时的说明（非阻塞）
+        if (damagedModel != null && LooksLikeSingleMeshObject(damagedModel))
+        {
+            EditorGUILayout.HelpBox(
+                "检测到你拖入的是单个蒙皮网格。点击下方按钮将自动按“单网格修复”处理，避免整人物体检与多余的 FBX 实例。",
+                MessageType.Warning
+            );
+        }
+
+        // 当用户在 FBX 槽位拖的是 FBX 子节点或场景实例时的说明（非阻塞）
+        if (_sourceFromSubObject && sourceFBX != null)
+        {
+            EditorGUILayout.HelpBox(
+                "你拖入的是 FBX 的子节点或场景中的实例。工具已自动提升为该 FBX 根资产，" +
+                "并会优先按子节点的名称/路径进行匹配，不会在场景中创建额外的 FBX 实例。",
+                MessageType.Warning
+            );
+        }
+
         EditorGUILayout.BeginHorizontal();
-        GUILayout.Label("显示所有网格物体（不仅缺失）", GUILayout.Width(200)); // 宽度可根据需要调整
+        GUILayout.Label("显示所有网格物体（不仅缺失）", GUILayout.Width(200));
         showAllMeshObjects = EditorGUILayout.Toggle(showAllMeshObjects);
         EditorGUILayout.EndHorizontal();
+
         EditorGUILayout.Space();
 
-        // 检查按钮
+        // 检查 / 自动分流按钮
         bool canCompare = damagedModel != null && sourceFBX != null;
         EditorGUI.BeginDisabledGroup(!canCompare);
         if (GUILayout.Button("检查骨骼与网格", GUILayout.Height(30)))
         {
-            CheckBonesAndMeshes();
+            // 若槽位1看起来是单个网格物体，自动走单网格修复；否则执行整人物体检
+            if (LooksLikeSingleMeshObject(damagedModel))
+                FixSingleMeshFromDamagedSlot();
+            else
+                CheckBonesAndMeshes();
         }
         EditorGUI.EndDisabledGroup();
 
         EditorGUILayout.Space();
+
         // ========== 缺失骨骼列表区域 ==========
         EditorGUILayout.LabelField("缺失骨骼列表", EditorStyles.boldLabel);
         EditorGUILayout.Space();
+
         if (missingBonesTree.Count > 0)
         {
             boneScrollPos = EditorGUILayout.BeginScrollView(boneScrollPos, GUILayout.MaxHeight(250));
@@ -91,6 +141,7 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         {
             EditorGUILayout.LabelField("暂无缺失骨骼数据，点击上方检查按钮开始检测", EditorStyles.centeredGreyMiniLabel);
         }
+
         EditorGUILayout.Space();
         EditorGUILayout.LabelField("", GUI.skin.horizontalSlider); // 分割线
         EditorGUILayout.Space();
@@ -99,7 +150,9 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         EditorGUILayout.LabelField(showAllMeshObjects ? "所有网格物体列表" : "缺失网格物体列表", EditorStyles.boldLabel);
         EditorGUILayout.Space();
 
-        bool hasMeshData = (showAllMeshObjects && allMeshObjectsTree.Count > 0) || (!showAllMeshObjects && missingMeshObjectsTree.Count > 0);
+        bool hasMeshData = (showAllMeshObjects && allMeshObjectsTree.Count > 0)
+                           || (!showAllMeshObjects && missingMeshObjectsTree.Count > 0);
+
         if (hasMeshData)
         {
             meshScrollPos = EditorGUILayout.BeginScrollView(meshScrollPos, GUILayout.MaxHeight(250));
@@ -120,10 +173,53 @@ public class FixSkinnedMeshBoneTool : EditorWindow
                 : "暂无缺失网格数据，点击上方检查按钮开始检测";
             EditorGUILayout.LabelField(emptyTip, EditorStyles.centeredGreyMiniLabel);
         }
+
         EditorGUILayout.Space();
     }
 
-    // ---------- 创建临时源实例 ----------
+    // ---------- 规范化：把 FBX 槽位中的选择“提升”为 FBX 根资产，并尝试生成路径提示 ----------
+    private void NormalizeSourceFBXSelection()
+    {
+        _sourceFromSubObject = false;
+        _sourceMeshPathHint = "";
+
+        if (sourceFBX == null) return;
+
+        // 如果用户拖的是场景中的实例或 FBX 子节点，尝试定位其 FBX 资产
+        string assetPath = AssetDatabase.GetAssetPath(sourceFBX);
+        if (string.IsNullOrEmpty(assetPath))
+        {
+            // 非资产（大概率场景实例） -> 找到其对应 FBX 资产
+            var original = PrefabUtility.GetCorrespondingObjectFromOriginalSource(sourceFBX);
+            if (original != null)
+            {
+                assetPath = AssetDatabase.GetAssetPath(original);
+                _sourceFromSubObject = true;
+                _sourceMeshPathHint = sourceFBX.name; // 简易名称提示（路径精定位在加载 FBX 内容后再尝试）
+            }
+        }
+        else
+        {
+            // 是资产。若拖的是 FBX 内子节点（不是根），也视为“子对象来源”
+            if (PrefabUtility.IsPartOfPrefabAsset(sourceFBX) && sourceFBX.transform.parent != null)
+            {
+                _sourceFromSubObject = true;
+                _sourceMeshPathHint = sourceFBX.name;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(assetPath))
+        {
+            // 以 FBX 根资产作为统一入口
+            var fbxRoot = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+            if (fbxRoot != null)
+            {
+                sourceFBX = fbxRoot;
+            }
+        }
+    }
+
+    // ---------- 创建临时源实例（双通道：优先内存打开；失败则预览场景实例化） ----------
     private GameObject CreateTempSource()
     {
         if (sourceFBX == null)
@@ -132,33 +228,93 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             return null;
         }
 
-        if (!PrefabUtility.IsPartOfPrefabAsset(sourceFBX))
+        string assetPath = AssetDatabase.GetAssetPath(sourceFBX);
+        if (string.IsNullOrEmpty(assetPath))
         {
-            SetMessage("请拖入 Project 窗口中的 FBX 预制体资产，禁止使用场景对象", MessageType.Error);
+            SetMessage("请拖入 Project 窗口中的 FBX 资产或其子节点/场景实例。", MessageType.Error);
             return null;
         }
 
-        GameObject temp = null;
+        // 通道 A：LoadPrefabContents（不污染当前场景）
         try
         {
-            temp = PrefabUtility.InstantiatePrefab(sourceFBX) as GameObject;
-            if (temp == null)
+            var root = PrefabUtility.LoadPrefabContents(assetPath);
+            if (root != null)
             {
-                SetMessage($"无法实例化预制体 '{sourceFBX.name}'，请检查FBX资产是否有效", MessageType.Error);
+                _prefabContentsRoots.Add(root);
+                return root;
+            }
+        }
+        catch
+        {
+            // fallthrough to 通道 B
+        }
+
+        // 通道 B：在 Preview Scene 里实例化，不污染当前场景层级
+        try
+        {
+            var src = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+            if (src == null)
+            {
+                SetMessage("无法加载 FBX 资产。", MessageType.Error);
                 return null;
             }
+
+            // 创建预览场景
+            var preview = EditorSceneManager.NewPreviewScene();
+            var instance = (GameObject)PrefabUtility.InstantiatePrefab(src);
+            if (instance == null)
+            {
+                EditorSceneManager.ClosePreviewScene(preview);
+                SetMessage("实例化 FBX 失败。", MessageType.Error);
+                return null;
+            }
+
+            // 移动到预览场景并隐藏
+            SceneManager.MoveGameObjectToScene(instance, preview);
+            instance.hideFlags = HideFlags.HideAndDontSave;
+
+            _previewSceneRoots[instance] = preview;
+            return instance;
         }
         catch (System.Exception e)
         {
-            SetMessage($"创建临时实例时发生异常：{e.Message}", MessageType.Error);
-            Debug.LogError($"创建临时实例异常：{e.Message}\n{e.StackTrace}");
+            SetMessage($"加载 FBX 内容失败：{e.Message}", MessageType.Error);
+            Debug.LogError($"加载 FBX 内容失败：{e.Message}\n{e.StackTrace}");
             return null;
         }
+    }
 
-        temp.hideFlags = HideFlags.HideAndDontSave;
-        temp.transform.position = Vector3.zero;
-        temp.transform.rotation = Quaternion.identity;
-        return temp;
+    // ---------- 统一清理临时源 ----------
+    private void CleanupTempSource(GameObject temp)
+    {
+        if (temp == null) return;
+
+        // 通道 A：LoadPrefabContents 打开的
+        if (_prefabContentsRoots.Contains(temp))
+        {
+            PrefabUtility.UnloadPrefabContents(temp);
+            _prefabContentsRoots.Remove(temp);
+            return;
+        }
+
+        // 通道 B：Preview Scene 实例化的
+        if (_previewSceneRoots.TryGetValue(temp, out var preview))
+        {
+            if (temp != null)
+            {
+                UnityEngine.Object.DestroyImmediate(temp);
+            }
+            if (preview.IsValid())
+            {
+                EditorSceneManager.ClosePreviewScene(preview);
+            }
+            _previewSceneRoots.Remove(temp);
+            return;
+        }
+
+        // 兜底：如果两者都不是（不太可能），直接销毁
+        UnityEngine.Object.DestroyImmediate(temp);
     }
 
     // ---------- 快捷设置提示信息 ----------
@@ -203,13 +359,13 @@ public class FixSkinnedMeshBoneTool : EditorWindow
     {
         List<BoneNode> result = new List<BoneNode>();
 
-        if (sourceNode.GetComponent<Renderer>() != null || sourceNode.GetComponent<SkinnedMeshRenderer>() != null)
+        if (sourceNode.GetComponent<Renderer>() != null
+            || sourceNode.GetComponent<SkinnedMeshRenderer>() != null)
         {
             return result;
         }
 
         bool isBoneMissing = !damagedPathDict.ContainsKey(currentFullPath);
-
         if (isBoneMissing)
         {
             BoneNode missingNode = new BoneNode
@@ -218,13 +374,11 @@ public class FixSkinnedMeshBoneTool : EditorWindow
                 fullPath = currentFullPath,
                 sourceTransform = sourceNode
             };
-
             foreach (Transform child in sourceNode)
             {
                 string childFullPath = currentFullPath + "/" + child.name;
                 missingNode.children.AddRange(FindMissingBones(child, damagedPathDict, childFullPath));
             }
-
             result.Add(missingNode);
         }
         else
@@ -235,7 +389,6 @@ public class FixSkinnedMeshBoneTool : EditorWindow
                 result.AddRange(FindMissingBones(child, damagedPathDict, childFullPath));
             }
         }
-
         return result;
     }
 
@@ -244,7 +397,8 @@ public class FixSkinnedMeshBoneTool : EditorWindow
     {
         if (sourceNode == null) return;
 
-        bool isMeshObject = sourceNode.GetComponent<Renderer>() != null || sourceNode.GetComponent<SkinnedMeshRenderer>() != null;
+        bool isMeshObject = sourceNode.GetComponent<Renderer>() != null
+                            || sourceNode.GetComponent<SkinnedMeshRenderer>() != null;
 
         if (isMeshObject)
         {
@@ -254,13 +408,11 @@ public class FixSkinnedMeshBoneTool : EditorWindow
                 fullPath = currentFullPath,
                 sourceTransform = sourceNode
             };
-
             foreach (Transform child in sourceNode)
             {
                 string childFullPath = string.IsNullOrEmpty(currentFullPath) ? child.name : currentFullPath + "/" + child.name;
                 CollectAllMeshes(child, damagedPathDict, childFullPath, meshNode.children);
             }
-
             meshTree.Add(meshNode);
         }
         else
@@ -283,13 +435,13 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         {
             Transform current = searchQueue.Dequeue();
             string nodeNameLower = current.name.ToLower();
-
-            if (nodeNameLower.Contains("armature") || nodeNameLower.Contains("hips") || nodeNameLower.Contains("rig"))
+            if (nodeNameLower.Contains("armature")
+                || nodeNameLower.Contains("hips")
+                || nodeNameLower.Contains("rig"))
             {
                 Debug.Log($"自动识别骨骼根节点：{current.name}");
                 return current;
             }
-
             foreach (Transform child in current)
             {
                 searchQueue.Enqueue(child);
@@ -300,13 +452,11 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         Debug.LogWarning("未自动识别到骨骼根节点，可手动指定骨骼根节点优化结果");
         return modelRoot;
     }
-
     // ---------- 核心检查逻辑 ----------
     private void CheckBonesAndMeshes()
     {
         Debug.Log("===== 开始检查骨骼与网格 =====");
         ClearMessage();
-
         missingBonesTree.Clear();
         missingMeshObjectsTree.Clear();
         allMeshObjectsTree.Clear();
@@ -327,7 +477,6 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             {
                 string customRootFullPath = GetFullPathRelativeToRoot(customRootBone, damagedModel.transform);
                 boneCompareRoot = FindTransformByFullPath(tempSourceInstance.transform, customRootFullPath);
-
                 if (boneCompareRoot == null)
                 {
                     SetMessage($"在源模型中未找到指定的根节点 '{customRootBone.name}'，请检查路径是否匹配", MessageType.Error);
@@ -382,9 +531,9 @@ public class FixSkinnedMeshBoneTool : EditorWindow
                 string meshInfo = showAllMeshObjects
                     ? $"共识别到 {totalAllMeshes} 个网格物体（其中缺失 {totalMissingMeshes} 个）"
                     : $"检测到 {totalMissingMeshes} 个缺失网格物体";
-
                 SetMessage($"检测到 {totalMissingBones} 个缺失骨骼，{meshInfo}", MessageType.Warning);
             }
+
             Debug.Log($"===== 检查完成：{totalMissingBones} 个缺失骨骼，{totalMissingMeshes} 个缺失网格（共{totalAllMeshes}个网格） =====");
         }
         catch (System.Exception e)
@@ -394,7 +543,7 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         }
         finally
         {
-            DestroyImmediate(tempSourceInstance);
+            CleanupTempSource(tempSourceInstance);
         }
     }
 
@@ -413,14 +562,13 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             }
             else
             {
-                EditorGUILayout.LabelField("  " + node.name);
+                EditorGUILayout.LabelField(" " + node.name);
             }
 
             if (GUILayout.Button("重建此骨骼及其子级", GUILayout.Width(150)))
             {
                 RecreateBoneChain(node);
             }
-
             EditorGUILayout.EndHorizontal();
 
             if (hasChildren && node.isExpanded)
@@ -430,7 +578,7 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         }
     }
 
-    // ---------- 绘制网格树UI（核心修改：红色/加粗） ----------
+    // ---------- 绘制网格树UI（红色/加粗） ----------
     private void DrawMeshTree(List<BoneNode> nodes, int indentLevel)
     {
         foreach (var node in nodes)
@@ -438,30 +586,20 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             EditorGUILayout.BeginHorizontal();
             GUILayout.Space(indentLevel * 20);
 
-            // 1. 判断是否为缺失网格（红色显示）
             bool isMissing = cachedDamagedPathDict != null && !cachedDamagedPathDict.ContainsKey(node.fullPath);
-            // 2. 判断是否为刚修复的网格（加粗显示）
             bool isRecentlyFixed = recentlyFixedMeshPaths.Contains(node.fullPath);
 
-            // 保存原始GUI状态
             Color originalColor = GUI.color;
             GUIStyle originalStyle = EditorStyles.label;
 
-            // 设置红色（仅缺失网格）
-            if (isMissing)
-            {
-                GUI.color = Color.red;
-            }
+            if (isMissing) GUI.color = Color.red;
 
-            // 设置加粗样式（仅刚修复的网格）
             GUIStyle displayStyle = originalStyle;
             if (isRecentlyFixed)
             {
-                displayStyle = new GUIStyle(originalStyle);
-                displayStyle.fontStyle = FontStyle.Bold;
+                displayStyle = new GUIStyle(originalStyle) { fontStyle = FontStyle.Bold };
             }
 
-            // 绘制节点名称
             bool hasChildren = node.children.Count > 0;
             if (hasChildren)
             {
@@ -469,18 +607,15 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             }
             else
             {
-                EditorGUILayout.LabelField("  " + node.name, displayStyle);
+                EditorGUILayout.LabelField(" " + node.name, displayStyle);
             }
 
-            // 绘制修复按钮
             if (GUILayout.Button("修复此网格物体", GUILayout.Width(150)))
             {
                 FixMeshObject(node);
             }
 
-            // 恢复原始GUI状态
             GUI.color = originalColor;
-
             EditorGUILayout.EndHorizontal();
 
             if (hasChildren && node.isExpanded)
@@ -512,6 +647,7 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             EditorUtility.SetDirty(damagedModel);
 
             CheckBonesAndMeshes();
+
             SetMessage($"骨骼 {targetNode.name} 及其子级重建完成！", MessageType.Info);
             Debug.Log($"骨骼 {targetNode.fullPath} 及其子级重建完成");
         }
@@ -522,20 +658,17 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         }
         finally
         {
-            DestroyImmediate(tempSourceInstance);
+            CleanupTempSource(tempSourceInstance);
             GUIUtility.ExitGUI();
         }
     }
 
-    // ---------- 实际蒙皮网格修复逻辑（新增：记录刚修复的网格） ----------
+    // ---------- 实际蒙皮网格修复逻辑（记录刚修复的网格） ----------
     private void FixMeshObject(BoneNode targetNode)
     {
         ClearMessage();
-
-        // 1. 记录刚修复的网格路径（用于加粗显示）
         recentlyFixedMeshPaths.Add(targetNode.fullPath);
 
-        // 2. 临时实例化源FBX
         GameObject tempSourceInstance = CreateTempSource();
         if (tempSourceInstance == null) return;
 
@@ -561,7 +694,6 @@ public class FixSkinnedMeshBoneTool : EditorWindow
 
             SkinnedMeshRenderer sourceMr = sourceMeshTransform.GetComponent<SkinnedMeshRenderer>();
             SkinnedMeshRenderer targetMr = targetMeshTransform.GetComponent<SkinnedMeshRenderer>();
-
             if (targetMr == null)
             {
                 targetMr = targetMeshTransform.gameObject.AddComponent<SkinnedMeshRenderer>();
@@ -580,12 +712,14 @@ public class FixSkinnedMeshBoneTool : EditorWindow
 
             Transform[] newBones = RebuildBonesArray(sourceMr.bones);
             List<string> lostBones = GetLostBones(newBones, sourceMr.bones);
+
             targetMr.bones = newBones;
 
             SetRootBone(targetMr, sourceMr, damagedModel.transform.root);
             RefreshRenderer(targetMr);
 
             ShowFixResult(lostBones, targetNode.name, targetMr);
+
             CheckBonesAndMeshes();
         }
         catch (System.Exception e)
@@ -595,7 +729,7 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         }
         finally
         {
-            DestroyImmediate(tempSourceInstance);
+            CleanupTempSource(tempSourceInstance);
             GUIUtility.ExitGUI();
         }
     }
@@ -605,7 +739,6 @@ public class FixSkinnedMeshBoneTool : EditorWindow
     {
         string parentPath = GetParentPath(node.fullPath);
         Transform parentTransform = FindTransformByFullPath(damagedModel.transform, parentPath);
-
         if (parentTransform == null)
         {
             SetMessage($"无法找到父节点 {parentPath}，无法创建网格物体", MessageType.Error);
@@ -636,10 +769,8 @@ public class FixSkinnedMeshBoneTool : EditorWindow
     private void BuildBoneMapRecursive(Transform node, Dictionary<string, Transform> boneMap)
     {
         if (node == null) return;
-
         if (!boneMap.ContainsKey(node.name))
             boneMap[node.name] = node;
-
         for (int i = 0; i < node.childCount; i++)
             BuildBoneMapRecursive(node.GetChild(i), boneMap);
     }
@@ -650,7 +781,6 @@ public class FixSkinnedMeshBoneTool : EditorWindow
 
         Material[] sourceMats = source.sharedMaterials;
         Material[] newMats = new Material[sourceMats.Length];
-
         for (int i = 0; i < sourceMats.Length; i++)
             newMats[i] = sourceMats[i] ?? CreateDefaultMaterial();
 
@@ -679,14 +809,12 @@ public class FixSkinnedMeshBoneTool : EditorWindow
                 _matchedBones++;
             }
         }
-
         return newBones;
     }
 
     private List<string> GetLostBones(Transform[] newBones, Transform[] sourceBones)
     {
         List<string> lost = new List<string>();
-
         if (sourceBones == null)
             return lost;
 
@@ -695,7 +823,6 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             if (newBones[i] == null && sourceBones[i] != null)
                 lost.Add(sourceBones[i].name);
         }
-
         return lost;
     }
 
@@ -718,7 +845,6 @@ public class FixSkinnedMeshBoneTool : EditorWindow
                 if (_boneMapCache.TryGetValue(name, out newRootBone))
                     break;
             }
-
             newRootBone = newRootBone ?? targetRoot;
         }
 
@@ -782,7 +908,6 @@ public class FixSkinnedMeshBoneTool : EditorWindow
     {
         string boneFullPath = GetFullPathRelativeToRoot(sourceBone, sourceModelRoot);
         Transform existingBone = FindTransformByFullPath(damagedModel.transform, boneFullPath);
-
         if (existingBone != null)
         {
             return;
@@ -790,7 +915,6 @@ public class FixSkinnedMeshBoneTool : EditorWindow
 
         string parentFullPath = GetParentPath(boneFullPath);
         Transform parentTransform = FindTransformByFullPath(damagedModel.transform, parentFullPath);
-
         if (parentTransform == null)
         {
             Transform sourceParent = sourceBone.parent;
@@ -809,12 +933,10 @@ public class FixSkinnedMeshBoneTool : EditorWindow
 
         GameObject newBone = new GameObject(sourceBone.name);
         Undo.RegisterCreatedObjectUndo(newBone, "创建骨骼");
-
         newBone.transform.SetParent(parentTransform);
         newBone.transform.localPosition = sourceBone.localPosition;
         newBone.transform.localRotation = sourceBone.localRotation;
         newBone.transform.localScale = sourceBone.localScale;
-
         Debug.Log($"成功创建骨骼：{boneFullPath}");
 
         foreach (Transform child in sourceBone)
@@ -862,7 +984,6 @@ public class FixSkinnedMeshBoneTool : EditorWindow
             if (current == null) return null;
             current = current.Find(segment);
         }
-
         return current;
     }
 
@@ -870,6 +991,7 @@ public class FixSkinnedMeshBoneTool : EditorWindow
     {
         if (string.IsNullOrEmpty(fullPath)) return "";
         int lastSlashIndex = fullPath.LastIndexOf('/');
+
         return lastSlashIndex == -1 ? "" : fullPath.Substring(0, lastSlashIndex);
     }
 
@@ -894,6 +1016,120 @@ public class FixSkinnedMeshBoneTool : EditorWindow
         public List<BoneNode> children = new List<BoneNode>();
         public bool isExpanded = false;
     }
-}
 
+    // ====================== 智能单网格自动分流支持 ======================
+
+    /// <summary>
+    /// 判断槽位①对象是否“像”单个网格：必须是带 SkinnedMeshRenderer 的子物体。
+    /// </summary>
+    private bool LooksLikeSingleMeshObject(GameObject go)
+    {
+        if (go == null) return false;
+        var smr = go.GetComponent<SkinnedMeshRenderer>();
+        if (smr == null) return false;
+        if (go.transform.parent == null) return false; // 作为场景根更像整人物
+        return true;
+    }
+
+    /// <summary>
+    /// 在 FBX 临时实例里按名称“最佳匹配”网格：先完全匹配，其次忽略大小写，再次包含匹配。
+    /// 若 _sourceMeshPathHint 提供了线索，可先尝试路径直达。
+    /// </summary>
+    private Transform FindBestMatchMesh(Transform root, string targetName)
+    {
+        if (root == null) return null;
+
+        // 若 UI 从子对象提升时留下了路径/名称提示，先尝试路径直达
+        if (!string.IsNullOrEmpty(_sourceMeshPathHint))
+        {
+            var hinted = FindTransformByFullPath(root, _sourceMeshPathHint);
+            if (hinted != null && hinted.GetComponent<SkinnedMeshRenderer>() != null)
+                return hinted;
+        }
+
+        if (string.IsNullOrEmpty(targetName)) return null;
+
+        var all = root.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+
+        var exact = all.FirstOrDefault(m => m.name == targetName);
+        if (exact != null) return exact.transform;
+
+        var icase = all.FirstOrDefault(m => string.Equals(m.name, targetName, System.StringComparison.OrdinalIgnoreCase));
+        if (icase != null) return icase.transform;
+
+        var contains = all.FirstOrDefault(m => m.name.IndexOf(targetName, System.StringComparison.OrdinalIgnoreCase) >= 0);
+        return contains != null ? contains.transform : null;
+    }
+
+    /// <summary>
+    /// 单网格修复入口：当槽位①为单个 SMR 物体时，被“检查骨骼与网格”按钮自动调用。
+    /// 不做整人物巡检，不展开网格树，且通过双通道临时加载避免污染场景。
+    /// </summary>
+    private void FixSingleMeshFromDamagedSlot()
+    {
+        ClearMessage();
+
+        if (damagedModel == null || sourceFBX == null)
+        {
+            SetMessage("请同时指定：单个网格对象（场景）与原始 FBX 资产（Project）。", MessageType.Warning);
+            return;
+        }
+
+        var targetMr = damagedModel.GetComponent<SkinnedMeshRenderer>();
+        if (targetMr == null)
+        {
+            SetMessage("拖入的对象不是单个蒙皮网格，无法走单网格修复。", MessageType.Warning);
+            return;
+        }
+
+        GameObject temp = CreateTempSource();
+        if (temp == null) return;
+
+        try
+        {
+            // 定位源网格（路径提示优先，其次名称匹配）
+            Transform srcMeshTr = FindBestMatchMesh(temp.transform, targetMr.name);
+            if (srcMeshTr == null)
+            {
+                SetMessage($"在原始 FBX 中找不到与 {targetMr.name} 可匹配的蒙皮网格。", MessageType.Error);
+                return;
+            }
+
+            var sourceMr = srcMeshTr.GetComponent<SkinnedMeshRenderer>();
+            if (sourceMr == null || sourceMr.sharedMesh == null)
+            {
+                SetMessage("匹配到的源网格不包含有效的蒙皮数据（sharedMesh 为空）。", MessageType.Error);
+                return;
+            }
+
+            BuildBoneMapCache(targetMr.transform.root);
+
+            Undo.RecordObject(targetMr, "LGC单网格骨骼修复");
+            SyncMeshMaterialsAndBounds(targetMr, sourceMr);
+
+            Transform[] newBones = RebuildBonesArray(sourceMr.bones);
+            List<string> lostBones = GetLostBones(newBones, sourceMr.bones);
+            targetMr.bones = newBones;
+
+            SetRootBone(targetMr, sourceMr, targetMr.transform.root);
+            RefreshRenderer(targetMr);
+
+            ShowFixResult(lostBones, targetMr.name, targetMr);
+
+            string fullPath = GetFullPathRelativeToRoot(targetMr.transform, targetMr.transform.root);
+            if (!string.IsNullOrEmpty(fullPath))
+                recentlyFixedMeshPaths.Add(fullPath);
+        }
+        catch (System.Exception e)
+        {
+            SetMessage($"单网格修复失败：{e.Message}", MessageType.Error);
+            Debug.LogException(e);
+        }
+        finally
+        {
+            CleanupTempSource(temp);
+            GUIUtility.ExitGUI();
+        }
+    }
+}
 #endif
